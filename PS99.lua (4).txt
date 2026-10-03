@@ -1,0 +1,637 @@
+repeat task.wait(0.5) until game:IsLoaded()
+local Config={WebhookURL="",WebhookInterval=60,HopEnabled=true,MineEnabled=true,MinPlayers=2,MaxPlayers=9,ScanInterval=0.5,InstanceTimeout=90,WorldTimeout=60,StuckTimeout={Onyx=7,Sunstone=3},SkipDuration=math.huge}
+local Players=game:GetService("Players")
+local RS=game:GetService("ReplicatedStorage")
+local RunService=game:GetService("RunService")
+local TeleportService=game:GetService("TeleportService")
+local HttpService=game:GetService("HttpService")
+local Workspace=game:GetService("Workspace")
+local LocalPlayer=Players.LocalPlayer
+while not LocalPlayer do task.wait(0.1) LocalPlayer=Players.LocalPlayer end
+local PlayerGui=LocalPlayer:WaitForChild("PlayerGui",999)
+local PlaceId=game.PlaceId
+local JobId=game.JobId
+local PreviousController=getgenv().VyOnyxController
+if type(PreviousController)=="table" and type(PreviousController.Stop)=="function" then pcall(PreviousController.Stop) end
+local INSTANCE_ID="SpaceMiningEvent"
+local MINE=CFrame.new(27606.806640625,16.6431827545166,-8104.4482421875)
+local GEM_IDS={["Eclipse Onyx Gem"]="Onyx",["Sunstone Gem"]="Sunstone"}
+local TARGET_IDS={Onyx="Onyx",Topaz="Sunstone"}
+local OreIcons={Onyx="https://tr.rbxcdn.com/180DAY-67b5f5255503bc6478c49e9968e092b0/420/420/Image/Png/noFilter",Sunstone="https://tr.rbxcdn.com/180DAY-6bf8a707ab31aa071842cdbeeff0d516/420/420/Image/Png/noFilter"}
+local State={Alive=true,Ready=false,InSpaceMine=false,IsHopping=false,PendingTeleport=nil,Teleporting=false,TeleportStartedAt=0,TeleportRetryAt=0,TeleportFailures=0,Counts={Onyx=0,Sunstone=0},Gems={Onyx=0,Sunstone=0},LastInventory=nil,Started=os.clock(),TotalHops=0,Target=nil,TargetKind=nil,World=nil,Status="Loading...",UIStatus="Loading...",UIInfo="",WebhookStatus=Config.WebhookURL~="" and "Ready" or "Not configured",LastWebhook=-math.huge,LastWebhookGems=-1,WebhookBusy=false,AnchoredRoot=nil,WasAnchored=false,Hold=nil,HoldAttachment=nil,CollisionParts={},HeldTarget=nil,LastRecovery=-math.huge,HeldHumanoid=nil,WasAutoRotate=nil,Skipped=setmetatable({},{__mode="k"}),SkipTotal=0,TimedTarget=nil,TargetSince=0,OnlyStuckLeft=false}
+local Modules={}
+local I
+local Connections={}
+local InputHook,SelectionHook,OriginalInput,OriginalSelection
+local function connect(signal,fn)
+    local c=signal:Connect(fn)
+    table.insert(Connections,c)
+    return c
+end
+local function rootPart()
+    local character=LocalPlayer.Character
+    local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+    if not humanoid or humanoid.Health<=0 then return nil end
+    return character:FindFirstChild("HumanoidRootPart")
+end
+local function safe(name,fn,...)
+    local args=table.pack(...)
+    local result=table.pack(pcall(function() return fn(table.unpack(args,1,args.n)) end))
+    if not result[1] then warn("[Vy SpaceMine] "..name..": "..tostring(result[2])) end
+    return table.unpack(result,1,result.n)
+end
+local function http(options)
+    local httpreq=request or http_request or syn and syn.request
+    assert(type(httpreq)=="function","Executor request() is unavailable")
+    local response=httpreq(options)
+    assert(type(response)=="table","HTTP request returned invalid response")
+    assert(tonumber(response.StatusCode),"HTTP response had no status code")
+    return response
+end
+local function webhookPayload(reason)
+    local seconds=math.floor(os.clock()-State.Started)
+    local timestamp=os.date("!%Y-%m-%dT%H:%M:%SZ")
+    local inventory=State.LastInventory or {Onyx=0,Sunstone=0}
+    return {username="Space Mine",avatar_url=OreIcons.Onyx,allowed_mentions={parse={}},embeds={{title="⛏ Space Mine | Mining Report",description="**"..tostring(reason).."**\nEclipse Onyx is mined first.",color=10716927,thumbnail={url=OreIcons.Onyx},fields={{name="💎 Onyx | Priority 1",value=string.format("**Collected:** `%d`\n**Ores remaining:** `%d`\n**Inventory:** `%d`",State.Gems.Onyx,State.Counts.Onyx,inventory.Onyx or 0),inline=true},{name="☀ Sunstone | Priority 2",value=string.format("**Collected:** `%d`\n**Ores remaining:** `%d`\n**Inventory:** `%d`",State.Gems.Sunstone,State.Counts.Sunstone,inventory.Sunstone or 0),inline=true},{name="👤 Session",value=string.format("**Account:** `%s`\n**Time:** `%02d:%02d`",LocalPlayer.Name,math.floor(seconds/60),seconds%60),inline=true},{name="🌐 Server",value="`"..game.JobId.."`",inline=false}},footer={text="Collected = session gains | Inventory = current total"},timestamp=timestamp}}}
+end
+local function sendWebhook(reason,force)
+    if Config.WebhookURL=="" or State.WebhookBusy then return end
+    if not Config.WebhookURL:match("^https://discord%.com/api/webhooks/%d+/[%w_%-]+") then
+        State.WebhookStatus="Invalid URL"
+        return
+    end
+    if os.clock()-State.LastWebhook<(force and 3 or Config.WebhookInterval) then return end
+    local gems=State.Gems.Onyx+State.Gems.Sunstone
+    if not force and gems==State.LastWebhookGems then return end
+    State.WebhookBusy=true
+    State.LastWebhook=os.clock()
+    local ok,response=pcall(http,{Url=Config.WebhookURL..(Config.WebhookURL:find("?",1,true) and "&wait=true" or "?wait=true"),Method="POST",Headers={["Content-Type"]="application/json"},Body=HttpService:JSONEncode(webhookPayload(reason))})
+    if ok and response.StatusCode>=200 and response.StatusCode<300 then
+        State.WebhookStatus="Sent "..os.date("!%H:%M:%S").." UTC"
+        State.LastWebhookGems=gems
+    elseif ok then
+        State.WebhookStatus="HTTP "..tostring(response.StatusCode)
+        if response.StatusCode==429 then
+            local decodedOK,data=pcall(function() return HttpService:JSONDecode(response.Body) end)
+            if decodedOK then State.LastWebhook=os.clock()+math.min(300,tonumber(data.retry_after) or 5) end
+        end
+    else
+        State.WebhookStatus="Failed"
+        warn("[Vy SpaceMine] Webhook: "..tostring(response))
+    end
+    State.WebhookBusy=false
+end
+local function releaseRoot()
+    if State.Hold then State.Hold:Destroy() State.Hold=nil end
+    if State.HoldAttachment then State.HoldAttachment:Destroy() State.HoldAttachment=nil end
+    local root=State.AnchoredRoot
+    State.AnchoredRoot=nil
+    if root and root.Parent then root.Anchored=State.WasAnchored end
+    for part,canCollide in pairs(State.CollisionParts) do
+        if part.Parent then part.CanCollide=canCollide end
+    end
+    table.clear(State.CollisionParts)
+    if State.HeldHumanoid and State.HeldHumanoid.Parent then State.HeldHumanoid.AutoRotate=State.WasAutoRotate end
+    State.HeldHumanoid=nil
+    State.WasAutoRotate=nil
+    State.HeldTarget=nil
+end
+local function clearTarget()
+    State.Target=nil
+    State.TargetKind=nil
+    releaseRoot()
+    if Modules.Auto then safe("Disable auto mine",Modules.Auto.Disable) end
+    if Modules.World then
+        safe("Clear target",function()
+            local world=Modules.World.GetLocal()
+            if world and not world.Destroyed then world:LocalSetTarget(nil) end
+        end)
+    end
+end
+local function validTarget(world,block)
+    return world and not world.Destroyed and block and block:GetPart().Parent and world:BlockIsValid(block) and TARGET_IDS[block:GetDirectory()._id]~=nil
+end
+local function miningActive()
+    return Config.MineEnabled and State.Ready and not State.IsHopping and State.World and not State.World.Respawning and validTarget(State.World,State.Target)
+end
+local function readInventory()
+    local save=Modules.Save.Get()
+    if not save or not save.Inventory or not save.Inventory.Misc then return nil end
+    local totals={Onyx=0,Sunstone=0}
+    for _,item in pairs(save.Inventory.Misc) do
+        local kind=GEM_IDS[item.id]
+        if kind then totals[kind]=totals[kind]+(tonumber(item._am) or 1) end
+    end
+    return totals
+end
+local function updateInventory()
+    local totals=readInventory()
+    if not totals then return end
+    if State.LastInventory then
+        for kind,amount in pairs(totals) do
+            State.Gems[kind]=State.Gems[kind]+math.max(0,amount-(State.LastInventory[kind] or 0))
+        end
+    end
+    State.LastInventory=totals
+end
+local function scan()
+    local world=Modules.World.GetLocal()
+    State.World=world
+    State.Counts={Onyx=0,Sunstone=0}
+    State.OnlyStuckLeft=false
+    if Modules.Instance.GetInstanceID()~=INSTANCE_ID or not world or world.Destroyed or not world.Model or not world.Model.Parent or world.Respawning then
+        clearTarget()
+        return false
+    end
+    local root=rootPart()
+    if not root then clearTarget() return false end
+    local now=os.clock()
+    local current=State.Target
+    local currentKind=current and validTarget(world,current) and TARGET_IDS[current:GetDirectory()._id] or nil
+    local stuckAfter=currentKind and Config.StuckTimeout[currentKind] or nil
+    if stuckAfter and not current.TempBroken and now-State.TargetSince>=stuckAfter then
+        State.Skipped[current]=now+Config.SkipDuration
+        State.SkipTotal=State.SkipTotal+1
+        State.Target=nil
+        State.TargetKind=nil
+    end
+    local nearest=nil
+    local nearestDistance=nil
+    local bestPriority=nil
+    local numberOfBlocks=0
+    local skippedLeft=0
+    for _,block in pairs(world.Blocks) do
+        numberOfBlocks=numberOfBlocks+1
+        local directory=block:GetDirectory()
+        local kind=directory and TARGET_IDS[directory._id] or nil
+        if kind and block:GetPart().Parent then
+            State.Counts[kind]=State.Counts[kind]+1
+            if not block.TempBroken then
+                local skipUntil=State.Skipped[block]
+                if skipUntil and skipUntil>now then
+                    skippedLeft=skippedLeft+1
+                else
+                    local distance=(root.Position-block:GetCFrame().Position).Magnitude
+                    local priority=kind=="Onyx" and 1 or 2
+                    if not bestPriority or priority<bestPriority or priority==bestPriority and distance<nearestDistance then
+                        nearest=block
+                        nearestDistance=distance
+                        bestPriority=priority
+                    end
+                end
+            end
+        end
+    end
+    local switchToOnyx=nearest and bestPriority==1 and State.Target and State.Target:GetDirectory()._id~="Onyx"
+    if not validTarget(world,State.Target) or switchToOnyx then State.Target=nearest end
+    State.TargetKind=State.Target and TARGET_IDS[State.Target:GetDirectory()._id] or nil
+    if State.Target~=State.TimedTarget then
+        State.TimedTarget=State.Target
+        State.TargetSince=now
+    end
+    State.OnlyStuckLeft=nearest==nil and skippedLeft>0
+    return numberOfBlocks>0
+end
+local function holdTarget()
+    if not miningActive() then releaseRoot() return end
+    local root=rootPart()
+    if not root then releaseRoot() return end
+    if State.AnchoredRoot~=root then
+        releaseRoot()
+        State.AnchoredRoot=root
+        State.WasAnchored=root.Anchored
+        local attachment=Instance.new("Attachment")
+        attachment.Name="MineHoldAttachment"
+        attachment.Parent=root
+        local hold=Instance.new("AlignPosition")
+        hold.Name="MineHold"
+        hold.Mode=Enum.PositionAlignmentMode.OneAttachment
+        hold.Attachment0=attachment
+        hold.MaxForce=math.max(10000,root.AssemblyMass*Workspace.Gravity*15)
+        hold.MaxVelocity=20
+        hold.Responsiveness=35
+        hold.RigidityEnabled=false
+        hold.ApplyAtCenterOfMass=true
+        hold.Parent=root
+        State.HoldAttachment=attachment
+        State.Hold=hold
+    end
+    for _,part in ipairs(root.Parent:GetDescendants()) do
+        if part:IsA("BasePart") then
+            if State.CollisionParts[part]==nil then State.CollisionParts[part]=part.CanCollide end
+            part.CanCollide=false
+        end
+    end
+    local humanoid=root.Parent:FindFirstChildOfClass("Humanoid")
+    if humanoid and State.HeldHumanoid~=humanoid then
+        State.HeldHumanoid=humanoid
+        State.WasAutoRotate=humanoid.AutoRotate
+    end
+    if humanoid then humanoid.AutoRotate=false end
+    root.Anchored=false
+    local targetFrame=State.Target:GetCFrame()*CFrame.new(0,6,0)
+    State.Hold.Position=targetFrame.Position
+    local now=os.clock()
+    local distance=(root.Position-targetFrame.Position).Magnitude
+    if State.HeldTarget~=State.Target or distance>12 and now-State.LastRecovery>=1 then
+        root.CFrame=targetFrame
+        root.AssemblyLinearVelocity=Vector3.zero
+        root.AssemblyAngularVelocity=Vector3.zero
+        State.LastRecovery=now
+    end
+    if root.AssemblyAngularVelocity.Magnitude>2 then root.AssemblyAngularVelocity=Vector3.zero end
+    State.HeldTarget=State.Target
+end
+local previous=gethui and select(2,pcall(gethui)) or nil
+if typeof(previous)~="Instance" then previous=PlayerGui end
+local old=previous:FindFirstChild("OnyxScannerMobile")
+if old then old:Destroy() end
+local ScreenGui=Instance.new("ScreenGui")
+ScreenGui.Name="OnyxScannerMobile"
+ScreenGui.ResetOnSpawn=false
+ScreenGui.Parent=previous
+local MainFrame=Instance.new("Frame",ScreenGui)
+MainFrame.Size=UDim2.new(0,260,0,285)
+MainFrame.Position=UDim2.new(0.02,0,0.15,0)
+MainFrame.BackgroundColor3=Color3.fromRGB(0,0,0)
+MainFrame.BackgroundTransparency=0.20
+MainFrame.BorderSizePixel=0
+MainFrame.Active=true
+MainFrame.Draggable=true
+Instance.new("UICorner",MainFrame).CornerRadius=UDim.new(0,8)
+local TitleLabel=Instance.new("TextLabel",MainFrame)
+TitleLabel.Size=UDim2.new(1,-20,0,24)
+TitleLabel.Position=UDim2.new(0,10,0,8)
+TitleLabel.BackgroundTransparency=1
+TitleLabel.Text="Vy Onyx + Sunstone Hunter"
+TitleLabel.TextColor3=Color3.fromRGB(240,240,245)
+TitleLabel.TextSize=18
+TitleLabel.Font=Enum.Font.SourceSansBold
+TitleLabel.TextXAlignment=Enum.TextXAlignment.Left
+local StatusLabel=Instance.new("TextLabel",MainFrame)
+StatusLabel.Size=UDim2.new(1,-20,0,22)
+StatusLabel.Position=UDim2.new(0,10,0,34)
+StatusLabel.BackgroundTransparency=1
+StatusLabel.Text="Loading..."
+StatusLabel.TextColor3=Color3.fromRGB(255,200,50)
+StatusLabel.TextSize=13
+StatusLabel.Font=Enum.Font.SourceSansBold
+StatusLabel.TextXAlignment=Enum.TextXAlignment.Left
+local InfoBox=Instance.new("TextLabel",MainFrame)
+InfoBox.Size=UDim2.new(1,-20,0,135)
+InfoBox.Position=UDim2.new(0,10,0,60)
+InfoBox.BackgroundTransparency=1
+InfoBox.Text="Onyx remaining: 0\nSunstone remaining: 0\nOnyx gained: 0\nSunstone gained: 0\nTarget: none\nHops: 0\nWebhook: "..State.WebhookStatus.."\nZone: loading"
+InfoBox.TextColor3=Color3.fromRGB(175,175,190)
+InfoBox.TextSize=12
+InfoBox.Font=Enum.Font.Code
+InfoBox.TextXAlignment=Enum.TextXAlignment.Left
+InfoBox.TextYAlignment=Enum.TextYAlignment.Top
+local HopButton=Instance.new("TextButton",MainFrame)
+HopButton.Size=UDim2.new(0.5,-15,0,32)
+HopButton.Position=UDim2.new(0,10,1,-80)
+HopButton.BackgroundColor3=Color3.fromRGB(245,80,100)
+HopButton.Text="HOP NOW"
+HopButton.TextColor3=Color3.fromRGB(255,255,255)
+HopButton.TextSize=13
+HopButton.Font=Enum.Font.SourceSansBold
+Instance.new("UICorner",HopButton).CornerRadius=UDim.new(0,6)
+local AutoHopBtn=Instance.new("TextButton",MainFrame)
+AutoHopBtn.Size=UDim2.new(0.5,-15,0,32)
+AutoHopBtn.Position=UDim2.new(0.5,5,1,-80)
+AutoHopBtn.BackgroundColor3=Color3.fromRGB(80,200,100)
+AutoHopBtn.Text="AUTO HOP: ON"
+AutoHopBtn.TextColor3=Color3.fromRGB(255,255,255)
+AutoHopBtn.TextSize=13
+AutoHopBtn.Font=Enum.Font.SourceSansBold
+Instance.new("UICorner",AutoHopBtn).CornerRadius=UDim.new(0,6)
+local AutoMineBtn=Instance.new("TextButton",MainFrame)
+AutoMineBtn.Size=UDim2.new(1,-20,0,32)
+AutoMineBtn.Position=UDim2.new(0,10,1,-40)
+AutoMineBtn.BackgroundColor3=Color3.fromRGB(80,200,100)
+AutoMineBtn.Text="AUTO MINE: ON"
+AutoMineBtn.TextColor3=Color3.fromRGB(255,255,255)
+AutoMineBtn.TextSize=13
+AutoMineBtn.Font=Enum.Font.SourceSansBold
+Instance.new("UICorner",AutoMineBtn).CornerRadius=UDim.new(0,6)
+local function refreshUI()
+    local zone=State.InSpaceMine and "Space Mine / Zone 8" or "loading"
+    State.UIStatus=State.Status
+    State.UIInfo=string.format("Onyx remaining: %d\nSunstone remaining: %d\nOnyx gained: %d\nSunstone gained: %d\nTarget: %s\nHops: %d\nWebhook: %s\nZone: %s",State.Counts.Onyx,State.Counts.Sunstone,State.Gems.Onyx,State.Gems.Sunstone,tostring(State.TargetKind or "none"),State.TotalHops,State.WebhookStatus,zone)
+end
+refreshUI()
+task.spawn(function()
+    while State.Alive do
+        pcall(function()
+            StatusLabel.Text=State.UIStatus
+            InfoBox.Text=State.UIInfo
+        end)
+        task.wait(0.1)
+    end
+end)
+local function attemptPendingTeleport()
+    local pending=State.PendingTeleport
+    if not pending or State.Teleporting or os.clock()<State.TeleportRetryAt then return false end
+    State.Teleporting=true
+    State.IsHopping=true
+    State.TeleportStartedAt=os.clock()
+    State.Status="Teleporting..."
+    refreshUI()
+    local ok=pcall(TeleportService.TeleportToPlaceInstance,TeleportService,pending.PlaceID,pending.JobID,LocalPlayer)
+    if not ok then
+        State.Teleporting=false
+        State.TeleportRetryAt=os.clock()+3
+        State.TeleportFailures=State.TeleportFailures+1
+        if State.TeleportFailures>=3 then
+            State.PendingTeleport=nil
+            State.TeleportFailures=0
+            State.IsHopping=false
+            State.Status="Teleport failed - finding another server"
+        else
+            State.Status="Teleport retry in 3s"
+        end
+        refreshUI()
+        return false
+    end
+    return true
+end
+local function HopServer()
+    if State.IsHopping or State.PendingTeleport or State.Teleporting then return end
+    State.IsHopping=true
+    clearTarget()
+    State.Status="Finding server..."
+    refreshUI()
+    task.spawn(function()
+        local httpreq=request or http_request or syn and syn.request
+        local ok,data=pcall(function()
+            local url=string.format("https://games.roblox.com/v1/games/%s/servers/0?sortOrder=Asc&excludeFullGames=true&limit=100",tostring(PlaceId))
+            if httpreq then return HttpService:JSONDecode(httpreq({Url=url,Method="GET"}).Body) end
+            return HttpService:JSONDecode(game:HttpGet(url))
+        end)
+        if ok and data and data.data then
+            local preferred={}
+            local fallback={}
+            for _,server in ipairs(data.data) do
+                if type(server)=="table" and server.id~=JobId and server.playing and server.maxPlayers and server.playing<server.maxPlayers then
+                    table.insert(fallback,server.id)
+                    if server.playing>=Config.MinPlayers and server.playing<=Config.MaxPlayers then table.insert(preferred,server.id) end
+                end
+            end
+            local candidates=#preferred>0 and preferred or fallback
+            if #candidates>0 then
+                State.TotalHops=State.TotalHops+1
+                safe("Inventory before hop",updateInventory)
+                task.spawn(function() safe("Webhook before hop",sendWebhook,"Server hop",true) end)
+                State.PendingTeleport={PlaceID=PlaceId,JobID=tostring(candidates[math.random(1,#candidates)])}
+                State.TeleportRetryAt=0
+                State.TeleportFailures=0
+                State.Status="Teleport queued..."
+                refreshUI()
+                attemptPendingTeleport()
+                return
+            end
+        end
+        State.Status="No different server found"
+        State.IsHopping=false
+        refreshUI()
+    end)
+end
+connect(HopButton.MouseButton1Click,HopServer)
+connect(AutoHopBtn.MouseButton1Click,function()
+    Config.HopEnabled=not Config.HopEnabled
+    AutoHopBtn.Text=Config.HopEnabled and "AUTO HOP: ON" or "AUTO HOP: OFF"
+    AutoHopBtn.BackgroundColor3=Config.HopEnabled and Color3.fromRGB(80,200,100) or Color3.fromRGB(200,80,80)
+end)
+connect(AutoMineBtn.MouseButton1Click,function()
+    Config.MineEnabled=not Config.MineEnabled
+    AutoMineBtn.Text=Config.MineEnabled and "AUTO MINE: ON" or "AUTO MINE: OFF"
+    AutoMineBtn.BackgroundColor3=Config.MineEnabled and Color3.fromRGB(80,200,100) or Color3.fromRGB(200,80,80)
+    if not Config.MineEnabled then
+        clearTarget()
+        State.Status="Auto mine off"
+    else
+        State.Status="Scanning Onyx + Sunstone"
+    end
+    refreshUI()
+end)
+connect(LocalPlayer.CharacterRemoving,clearTarget)
+connect(TeleportService.TeleportInitFailed,function(player,teleportResult,errorMessage)
+    if player~=LocalPlayer or not State.Teleporting then return end
+    State.Teleporting=false
+    local lowered=string.lower(tostring(teleportResult or "").." "..tostring(errorMessage or ""))
+    local isFull=string.find(lowered,"full",1,true)~=nil or string.find(lowered,"gamefull",1,true)~=nil
+    if State.PendingTeleport then
+        State.TeleportRetryAt=os.clock()+(isFull and 3 or 5)
+        if isFull then
+            State.TeleportFailures=0
+            State.Status="Server full - retrying teleport"
+        else
+            State.TeleportFailures=State.TeleportFailures+1
+            if State.TeleportFailures>=3 then
+                State.PendingTeleport=nil
+                State.TeleportFailures=0
+                State.IsHopping=false
+                State.Status="Teleport failed - finding another server"
+            else
+                State.Status="Teleport failed - retrying"
+            end
+        end
+    else
+        State.IsHopping=false
+    end
+    refreshUI()
+end)
+connect(LocalPlayer.OnTeleport,function(teleportState)
+    if teleportState==Enum.TeleportState.Started or teleportState==Enum.TeleportState.InProgress then
+        State.Status="Teleport started"
+        refreshUI()
+    end
+end)
+connect(RunService.PreSimulation,holdTarget)
+local function enterSpaceMine()
+    if Modules.Instance.GetInstanceID()==INSTANCE_ID then
+        State.InSpaceMine=true
+        return
+    end
+    State.Status="Entering Space Mine..."
+    refreshUI()
+    assert(type(setthreadidentity)=="function","setthreadidentity unavailable")
+    local finished=false
+    local enterOK=false
+    local enterErr=nil
+    task.spawn(function()
+        local identityOK,identityErr=pcall(setthreadidentity,2)
+        if identityOK then
+            enterOK,enterErr=pcall(function() I.Enter("SpaceMiningEvent") end)
+            pcall(setthreadidentity,7)
+        else
+            enterErr=identityErr
+        end
+        finished=true
+    end)
+    local deadline=os.clock()+15
+    while not finished and os.clock()<deadline do task.wait(0.05) end
+    assert(finished,"Space Mine Enter call timed out")
+    assert(enterOK,enterErr)
+end
+local function waitForSpaceMineWorld()
+    local deadline=os.clock()+Config.InstanceTimeout
+    while os.clock()<deadline do
+        local world=Modules.World.GetLocal()
+        local root=rootPart()
+        if Modules.Instance.GetInstanceID()==INSTANCE_ID and world and not world.Destroyed and world.Model and world.Model.Parent and root then
+            State.World=world
+            State.InSpaceMine=true
+            return true
+        end
+        State.Status="Waiting for Space Mine world..."
+        refreshUI()
+        task.wait(0.25)
+    end
+    return false
+end
+local function teleportZone8AndWaitBlocks()
+    local root=rootPart()
+    assert(root,"Character unavailable before Zone 8 teleport")
+    root.CFrame=MINE
+    State.Status="Zone 8 - waiting for blocks..."
+    refreshUI()
+    local deadline=os.clock()+Config.WorldTimeout
+    while os.clock()<deadline do
+        local world=Modules.World.GetLocal()
+        if world and not world.Destroyed and not world.Respawning and world.Blocks and next(world.Blocks) then
+            State.World=world
+            return true
+        end
+        task.wait(0.25)
+    end
+    return false
+end
+local function installMiningHooks()
+    assert(type(hookfunction)=="function" and type(restorefunction)=="function","hookfunction/restorefunction unavailable")
+    InputHook=Modules.Input.IsInputDown
+    OriginalInput=hookfunction(InputHook,function()
+        if miningActive() then return not State.Target.TempBroken end
+        return OriginalInput()
+    end)
+    SelectionHook=Modules.Selection.GetSelectedBlock
+    OriginalSelection=hookfunction(SelectionHook,function()
+        if miningActive() then return State.Target,State.World end
+        return OriginalSelection()
+    end)
+end
+local function startup()
+    pcall(function() settings().Rendering.QualityLevel=Enum.QualityLevel.Level01 end)
+    local library=RS:WaitForChild("Library",30)
+    assert(library,"Library not loaded")
+    local client=library:WaitForChild("Client",30)
+    assert(client,"Client modules not loaded")
+    I=require(RS.Library.Client.InstancingCmds)
+    Modules.Instance=I
+    Modules.World=require(client.ToolCmds.BlockWorldClient)
+    Modules.Auto=require(client.AutoMineCmds)
+    Modules.Save=require(client.Save)
+    Modules.Input=require(client.ToolCmds.MiningFrontend.GenericInput)
+    Modules.Selection=require(client.ToolCmds.BlockInteraction)
+    Modules.Auto.Disable()
+    local inventoryDeadline=os.clock()+30
+    while not Modules.Save.Get() and os.clock()<inventoryDeadline do task.wait(0.25) end
+    updateInventory()
+    enterSpaceMine()
+    assert(waitForSpaceMineWorld(),"Space Mine world did not load")
+    assert(teleportZone8AndWaitBlocks(),"Zone 8 blocks did not load")
+    installMiningHooks()
+    State.Ready=true
+    State.Status="Scanning Onyx + Sunstone"
+    refreshUI()
+end
+local ok,err=pcall(startup)
+if not ok then
+    State.Status="Startup error"
+    warn("[Vy SpaceMine] "..tostring(err))
+    refreshUI()
+    return
+end
+local function stop()
+    if not State.Alive then return end
+    State.Alive=false
+    clearTarget()
+    if InputHook and type(restorefunction)=="function" then pcall(restorefunction,InputHook) InputHook=nil end
+    if SelectionHook and type(restorefunction)=="function" then pcall(restorefunction,SelectionHook) SelectionHook=nil end
+    for _,connection in ipairs(Connections) do pcall(function() connection:Disconnect() end) end
+    table.clear(Connections)
+    if ScreenGui and ScreenGui.Parent then ScreenGui:Destroy() end
+end
+getgenv().VyOnyxController={Stop=stop,State=State,Config=Config}
+task.spawn(function()
+    while State.Alive do
+        if State.Teleporting then
+            if os.clock()-State.TeleportStartedAt>=20 then
+                State.Teleporting=false
+                State.TeleportRetryAt=os.clock()+3
+                State.Status="Teleport timeout - retrying"
+                refreshUI()
+            end
+        elseif State.PendingTeleport then
+            attemptPendingTeleport()
+        end
+        task.wait(0.5)
+    end
+end)
+task.spawn(function()
+    while State.Alive do
+        task.wait(0.25)
+        safe("Inventory",updateInventory)
+        refreshUI()
+    end
+end)
+task.spawn(function()
+    while State.Alive do
+        task.wait(1)
+        if State.Ready then safe("Webhook",sendWebhook,"Mining update",false) end
+    end
+end)
+task.spawn(function()
+    while State.Alive do
+        task.wait(Config.ScanInterval)
+        if State.IsHopping then continue end
+        if not Config.MineEnabled then clearTarget() continue end
+        Modules.Auto.Disable()
+        local loaded=scan()
+        if not loaded then
+            State.Status="Waiting for Space Mine blocks..."
+            continue
+        end
+        if State.Counts.Onyx+State.Counts.Sunstone==0 then
+            clearTarget()
+            State.Status=Config.HopEnabled and "No Onyx/Sunstone - hopping" or "No Onyx/Sunstone"
+            refreshUI()
+            if Config.HopEnabled then HopServer() end
+            continue
+        end
+        if State.OnlyStuckLeft then
+            clearTarget()
+            if Config.HopEnabled then
+                State.Status="Only stuck ore left - hopping"
+                refreshUI()
+                HopServer()
+            else
+                table.clear(State.Skipped)
+                State.Status="Only stuck ore left - retrying"
+                refreshUI()
+            end
+            continue
+        end
+        if State.Target then
+            State.Status="Mining "..tostring(State.TargetKind)..(State.SkipTotal>0 and " | skipped "..State.SkipTotal or "")
+            holdTarget()
+            if not State.Target.TempBroken then
+                State.World:LocalSetTarget(State.Target)
+                Modules.Input.Pressed:FireAsync()
+            end
+        else
+            State.Status="Waiting for ore break confirmation..."
+        end
+        refreshUI()
+    end
+end)
